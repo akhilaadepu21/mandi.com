@@ -176,15 +176,35 @@ const CATEGORIES: { name: string; items: SeedItem[] }[] = [
 function slugify(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || `item-${Date.now()}`;
 }
-
 async function main() {
   console.log('Seeding Mandi.com demo restaurant from the real menu card...');
 
   // Clean slate: delete any prior "mandi-com" demo restaurant so renamed/
   // removed dishes from earlier (incorrect) seed data don't linger. Cascades
-  // take care of its tables, menu, orders, staff memberships, etc.
+  // take care of most of its tables (menu, staff memberships, etc.), but
+  // order_items.menu_item_id/portion_id use "on delete restrict" — Postgres
+  // checks restrict constraints immediately per-row (unlike the default
+  // "no action", which defers to end-of-statement), so cascading straight
+  // from restaurants into menu_items fails with 23503 while order_items
+  // rows still reference them. Deleting order_items then orders up front
+  // clears that restrict path before the restaurant cascade ever reaches it.
   const { data: existing } = await supabase.from('restaurants').select('id').eq('slug', 'mandi-com').maybeSingle();
   if (existing) {
+    const { data: existingOrders, error: ordersSelErr } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('restaurant_id', existing.id);
+    if (ordersSelErr) throw ordersSelErr;
+
+    const orderIds = (existingOrders ?? []).map((o) => o.id);
+    if (orderIds.length) {
+      const { error: oiErr } = await supabase.from('order_items').delete().in('order_id', orderIds);
+      if (oiErr) throw oiErr;
+
+      const { error: ordersDelErr } = await supabase.from('orders').delete().eq('restaurant_id', existing.id);
+      if (ordersDelErr) throw ordersDelErr;
+    }
+
     const { error: delErr } = await supabase.from('restaurants').delete().eq('id', existing.id);
     if (delErr) throw delErr;
     console.log('Removed previous demo restaurant data.');
